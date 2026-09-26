@@ -107,6 +107,8 @@ pub(super) struct FrameCodec {
     in_buf_max_read: usize,
     /// Buffer to send packets to the network.
     out_buffer: Vec<u8>,
+    /// Length of the `out_buffer` prefix already written to the stream.
+    out_buffer_written: usize,
     /// Capacity limit for `out_buffer`.
     max_out_buffer_len: usize,
     /// Buffer target length to reach before writing to the stream
@@ -126,6 +128,7 @@ impl FrameCodec {
             in_buffer: BytesMut::with_capacity(in_buf_len),
             in_buf_max_read: in_buf_len.max(FrameHeader::MAX_SIZE),
             out_buffer: <_>::default(),
+            out_buffer_written: 0,
             max_out_buffer_len: usize::MAX,
             out_buffer_write_len: 0,
             header: None,
@@ -140,6 +143,7 @@ impl FrameCodec {
             in_buffer,
             in_buf_max_read: min_in_buf_len.max(FrameHeader::MAX_SIZE),
             out_buffer: <_>::default(),
+            out_buffer_written: 0,
             max_out_buffer_len: usize::MAX,
             out_buffer_write_len: 0,
             header: None,
@@ -251,16 +255,23 @@ impl FrameCodec {
     where
         Stream: Write,
     {
-        if frame.len() + self.out_buffer.len() > self.max_out_buffer_len {
+        let unwritten = self.out_buffer.len() - self.out_buffer_written;
+        if frame.len() + unwritten > self.max_out_buffer_len {
             return Err(Error::WriteBufferFull(Message::Frame(frame).into()));
         }
 
         trace!("writing frame {frame}");
 
+        // Drop the written prefix only once it is at least as long as the rest,
+        // so each byte is moved at most once on average.
+        if self.out_buffer_written >= unwritten {
+            self.out_buffer.drain(..self.out_buffer_written);
+            self.out_buffer_written = 0;
+        }
         self.out_buffer.reserve(frame.len());
         frame.format_into_buf(&mut self.out_buffer).expect("Bug: can't write to vector");
 
-        if self.out_buffer.len() > self.out_buffer_write_len {
+        if self.out_buffer.len() - self.out_buffer_written > self.out_buffer_write_len {
             self.write_out_buffer(stream)
         } else {
             Ok(())
@@ -274,8 +285,8 @@ impl FrameCodec {
     where
         Stream: Write,
     {
-        while !self.out_buffer.is_empty() {
-            let len = stream.write(&self.out_buffer)?;
+        while self.out_buffer_written < self.out_buffer.len() {
+            let len = stream.write(&self.out_buffer[self.out_buffer_written..])?;
             if len == 0 {
                 // This is the same as "Connection reset by peer"
                 return Err(IoError::new(
@@ -284,8 +295,10 @@ impl FrameCodec {
                 )
                 .into());
             }
-            self.out_buffer.drain(0..len);
+            self.out_buffer_written += len;
         }
+        self.out_buffer.clear();
+        self.out_buffer_written = 0;
 
         Ok(())
     }
@@ -294,11 +307,14 @@ impl FrameCodec {
 #[cfg(test)]
 mod tests {
 
-    use crate::error::{CapacityError, Error};
+    use crate::error::{CapacityError, Error, Result};
 
-    use super::{Frame, FrameSocket};
+    use super::{
+        coding::{Data, OpCode},
+        Frame, FrameSocket,
+    };
 
-    use std::io::Cursor;
+    use std::io::{self, Cursor};
 
     #[test]
     fn read_frames() {
@@ -343,6 +359,61 @@ mod tests {
 
         let (buf, _) = sock.into_inner();
         assert_eq!(buf, vec![0x89, 0x02, 0x04, 0x05, 0x8a, 0x01, 0x01]);
+    }
+
+    /// Accepts at most 7 bytes per write and fails every other write with `WouldBlock`.
+    #[derive(Default)]
+    struct TrickleWrite {
+        wire: Vec<u8>,
+        block: bool,
+    }
+
+    impl io::Write for TrickleWrite {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.block = !self.block;
+            if self.block {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let len = buf.len().min(7);
+            self.wire.extend_from_slice(&buf[..len]);
+            Ok(len)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_frames_in_partial_writes() {
+        /// Returns whether `res` is a `WouldBlock` error, panics on other errors.
+        fn would_block(res: Result<()>) -> bool {
+            match res {
+                Ok(()) => false,
+                Err(Error::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => true,
+                Err(err) => panic!("{err}"),
+            }
+        }
+
+        let frames = || {
+            (0..4).map(|i| {
+                Frame::message(vec![i; 10 + 40 * i as usize], OpCode::Data(Data::Binary), true)
+            })
+        };
+        let mut expected = Vec::new();
+        for frame in frames() {
+            frame.format(&mut expected).unwrap();
+        }
+
+        // Queue each frame while earlier ones are still partly written.
+        let mut sock = FrameSocket::new(TrickleWrite::default());
+        for frame in frames() {
+            would_block(sock.write(frame));
+            would_block(sock.flush());
+        }
+        while would_block(sock.flush()) {}
+
+        assert_eq!(sock.into_inner().0.wire, expected);
     }
 
     #[test]
