@@ -64,3 +64,16 @@ fn send_close_message_with_124_byte_reason_fails_and_sends_nothing() {
     ws.send(Message::Text("still open".into())).unwrap();
     assert_eq!(ws.get_ref().0[..2], [0x81, 10]);
 }
+
+#[test]
+fn ping_and_pong_with_126_byte_payload_fail_and_send_nothing() {
+    let mut ws = server();
+
+    assert!(is_control_frame_too_big(ws.send(Message::Ping(vec![0; 126].into()))));
+    assert!(is_control_frame_too_big(ws.send(Message::Pong(vec![0; 126].into()))));
+    assert!(ws.get_ref().0.is_empty());
+
+    ws.send(Message::Ping(vec![0; 125].into())).unwrap();
+    ws.send(Message::Pong(vec![0; 125].into())).unwrap();
+    assert_eq!(ws.get_ref().0.len(), 2 * (2 + 125));
+}

@@ -301,8 +301,8 @@ impl<Stream: Read + Write> WebSocket<Stream> {
     /// - [`Error::Io`] is returned if the underlying connection returns an error
     ///   (consider these fatal except for WouldBlock).
     /// - [`Error::Capacity`] if your message size is bigger than the configured max message size.
-    /// - [`ProtocolError::ControlFrameTooBig`] if a close reason is over 123 bytes.
-    ///   Nothing is sent and the connection stays open.
+    /// - [`ProtocolError::ControlFrameTooBig`] if a ping or pong payload is over 125 bytes,
+    ///   or a close reason is over 123 bytes. Nothing is sent and the connection stays open.
     pub fn write(&mut self, message: Message) -> Result<()> {
         self.context.write(&mut self.socket, message)
     }
@@ -506,6 +506,9 @@ impl WebSocketContext {
         }
 
         let frame = match message {
+            Message::Ping(data) | Message::Pong(data) if data.len() > 125 => {
+                return Err(Error::Protocol(ProtocolError::ControlFrameTooBig));
+            }
             Message::Text(data) => Frame::message(data, OpCode::Data(OpData::Text), true),
             Message::Binary(data) => Frame::message(data, OpCode::Data(OpData::Binary), true),
             Message::Ping(data) => Frame::ping(data),
