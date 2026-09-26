@@ -301,6 +301,8 @@ impl<Stream: Read + Write> WebSocket<Stream> {
     /// - [`Error::Io`] is returned if the underlying connection returns an error
     ///   (consider these fatal except for WouldBlock).
     /// - [`Error::Capacity`] if your message size is bigger than the configured max message size.
+    /// - [`ProtocolError::ControlFrameTooBig`] if a close reason is over 123 bytes.
+    ///   Nothing is sent and the connection stays open.
     pub fn write(&mut self, message: Message) -> Result<()> {
         self.context.write(&mut self.socket, message)
     }
@@ -334,6 +336,9 @@ impl<Stream: Read + Write> WebSocket<Stream> {
     ///
     /// It is thus safe to drop the underlying connection as soon as [Error::ConnectionClosed]
     /// is returned from [`read`](Self::read) or [`flush`](Self::flush).
+    ///
+    /// A close reason over 123 bytes returns [`ProtocolError::ControlFrameTooBig`].
+    /// Nothing is sent and the connection stays open.
     pub fn close(&mut self, code: Option<CloseFrame>) -> Result<()> {
         self.context.close(&mut self.socket, code)
     }
@@ -599,8 +604,11 @@ impl WebSocketContext {
         Stream: Read + Write,
     {
         if let WebSocketState::Active = self.state {
-            self.state = WebSocketState::ClosedByUs;
             let frame = Frame::close(code);
+            if frame.payload().len() > 125 {
+                return Err(Error::Protocol(ProtocolError::ControlFrameTooBig));
+            }
+            self.state = WebSocketState::ClosedByUs;
             self._write(stream, Some(frame))?;
         }
         self.flush(stream)
