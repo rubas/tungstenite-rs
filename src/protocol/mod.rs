@@ -445,7 +445,8 @@ impl WebSocketContext {
     /// Read a message from the provided stream, if possible.
     ///
     /// This function sends pong and close responses automatically.
-    /// However, it never blocks on write.
+    /// However, it never blocks on write. The exception is a server that has received a close
+    /// frame: it has nothing left to read, so it returns `WouldBlock` until the reply is flushed.
     pub fn read<Stream>(&mut self, stream: &mut Stream) -> Result<Message>
     where
         Stream: Read + Write,
@@ -454,19 +455,20 @@ impl WebSocketContext {
         self.state.check_not_terminated()?;
 
         loop {
-            if self.additional_send.is_some() || self.unflushed_additional {
+            if self.additional_send.is_some() || self.unflushed_additional || self.server_closing()
+            {
                 // Since we may get ping or close, we need to reply to the messages even during read.
                 match self.flush(stream) {
                     Ok(_) => {}
-                    Err(Error::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
-                        // If blocked continue reading, but try again later
+                    // If blocked continue reading, but try again later. A closing server must
+                    // not read on: it would get EOF and terminate before its close reply is sent.
+                    Err(Error::Io(err))
+                        if err.kind() == io::ErrorKind::WouldBlock && !self.server_closing() =>
+                    {
                         self.unflushed_additional = true;
                     }
                     Err(err) => return Err(err),
                 }
-            } else if self.role == Role::Server && !self.state.can_read() {
-                self.state = WebSocketState::Terminated;
-                return Err(Error::ConnectionClosed);
             }
 
             // If we get here, either write blocks or we have nothing to write.
@@ -533,7 +535,25 @@ impl WebSocketContext {
         self.frame.write_out_buffer(stream)?;
         stream.flush()?;
         self.unflushed_additional = false;
+
+        // If we're closing and there is nothing to send anymore, we should close the connection.
+        if self.server_closing() {
+            // The underlying TCP connection, in most normal cases, SHOULD be closed
+            // first by the server, so that it holds the TIME_WAIT state and not the
+            // client (as this would prevent it from re-opening the connection for 2
+            // maximum segment lifetimes (2MSL), while there is no corresponding
+            // server impact as a TIME_WAIT connection is immediately reopened upon
+            // a new SYN with a higher seq number). (RFC 6455)
+            self.state = WebSocketState::Terminated;
+            return Err(Error::ConnectionClosed);
+        }
         Ok(())
+    }
+
+    /// Tell if we are a server that has received a close frame, or has terminated.
+    /// [`flush`](Self::flush) then sends what is left and terminates the connection.
+    fn server_closing(&self) -> bool {
+        self.role == Role::Server && !self.state.can_read()
     }
 
     /// Writes any data in the out_buffer, `additional_send` and given `data`.
@@ -573,20 +593,7 @@ impl WebSocketContext {
             self.unflushed_additional
         };
 
-        // If we're closing and there is nothing to send anymore, we should close the connection.
-        if self.role == Role::Server && !self.state.can_read() {
-            // The underlying TCP connection, in most normal cases, SHOULD be closed
-            // first by the server, so that it holds the TIME_WAIT state and not the
-            // client (as this would prevent it from re-opening the connection for 2
-            // maximum segment lifetimes (2MSL), while there is no corresponding
-            // server impact as a TIME_WAIT connection is immediately reopened upon
-            // a new SYN with a higher seq number). (RFC 6455)
-            self.frame.write_out_buffer(stream)?;
-            self.state = WebSocketState::Terminated;
-            Err(Error::ConnectionClosed)
-        } else {
-            Ok(should_flush)
-        }
+        Ok(should_flush)
     }
 
     /// Close the connection.
