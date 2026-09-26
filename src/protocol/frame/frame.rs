@@ -24,7 +24,7 @@ use bytes::{Bytes, BytesMut};
 pub struct CloseFrame {
     /// The reason as a code.
     pub code: CloseCode,
-    /// The reason as text string. At most 123 bytes to send.
+    /// The reason as text string. Sending fails if it is over 123 bytes.
     pub reason: Utf8Bytes,
 }
 
