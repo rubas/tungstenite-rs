@@ -75,7 +75,8 @@ pub struct WebSocketConfig {
     /// Note: Should always be at least [`write_buffer_size + 1 message`](Self::write_buffer_size)
     /// and probably a little more depending on error handling strategy.
     ///
-    /// Note: A close frame is always queued, even if it goes over this limit.
+    /// Note: The close frame of the close handshake is always queued, even if it goes over
+    /// this limit.
     pub max_write_buffer_size: usize,
     /// The maximum size of an incoming message. `None` means no size limit. The default value is 64 MiB
     /// which should be reasonably big for all normal use-cases but small enough to prevent
@@ -278,8 +279,8 @@ impl<Stream: Read + Write> WebSocket<Stream> {
     /// or [`flush`](Self::flush).
     ///
     /// If the write buffer would exceed the configured [`WebSocketConfig::max_write_buffer_size`]
-    /// [`Err(WriteBufferFull(msg_frame))`](Error::WriteBufferFull) is returned. A close frame
-    /// is always queued.
+    /// [`Err(WriteBufferFull(msg_frame))`](Error::WriteBufferFull) is returned. A
+    /// [`Message::Close`] is always queued.
     ///
     /// This call will generally not flush. However, if there are queued automatic messages
     /// they will be written and eagerly flushed.
@@ -448,7 +449,8 @@ impl WebSocketContext {
     /// Read a message from the provided stream, if possible.
     ///
     /// This function sends pong and close responses automatically.
-    /// However, it never blocks on write.
+    /// However, it never blocks on write. The exception is a server that has received a close
+    /// frame: it has nothing left to read, so it returns `WouldBlock` until the reply is flushed.
     pub fn read<Stream>(&mut self, stream: &mut Stream) -> Result<Message>
     where
         Stream: Read + Write,
@@ -462,8 +464,8 @@ impl WebSocketContext {
                 // Since we may get ping or close, we need to reply to the messages even during read.
                 match self.flush(stream) {
                     Ok(_) => {}
-                    // If blocked continue reading, but try again later. A closing server has
-                    // nothing left to read, so it returns `WouldBlock` to retry the flush.
+                    // If blocked continue reading, but try again later. A closing server must
+                    // not read on: it would get EOF and terminate before its close reply is sent.
                     Err(Error::Io(err))
                         if err.kind() == io::ErrorKind::WouldBlock && !self.server_closing() =>
                     {
@@ -491,8 +493,8 @@ impl WebSocketContext {
     /// or [`flush`](Self::flush).
     ///
     /// If the write buffer would exceed the configured [`WebSocketConfig::max_write_buffer_size`]
-    /// [`Err(WriteBufferFull(msg_frame))`](Error::WriteBufferFull) is returned. A close frame
-    /// is always queued.
+    /// [`Err(WriteBufferFull(msg_frame))`](Error::WriteBufferFull) is returned. A
+    /// [`Message::Close`] is always queued.
     pub fn write<Stream>(&mut self, stream: &mut Stream, message: Message) -> Result<()>
     where
         Stream: Read + Write,
@@ -529,9 +531,6 @@ impl WebSocketContext {
     ///
     /// Ensures all messages previously passed to [`write`](Self::write) and automatically
     /// queued pong responses are written & flushed into the `stream`.
-    ///
-    /// On a server that finished the close handshake, it returns
-    /// [`Error::ConnectionClosed`] once everything is flushed.
     #[inline]
     pub fn flush<Stream>(&mut self, stream: &mut Stream) -> Result<()>
     where
@@ -542,7 +541,7 @@ impl WebSocketContext {
         stream.flush()?;
         self.unflushed_additional = false;
 
-        // If we're closing and everything is sent, we should close the connection.
+        // If we're closing and there is nothing to send anymore, we should close the connection.
         if self.server_closing() {
             // The underlying TCP connection, in most normal cases, SHOULD be closed
             // first by the server, so that it holds the TIME_WAIT state and not the
@@ -556,16 +555,15 @@ impl WebSocketContext {
         Ok(())
     }
 
-    /// Tell if we are a server that finished the close handshake. It only has to send
-    /// what is left, then [`flush`](Self::flush) terminates the connection.
+    /// Tell if we are a server that has received a close frame, or has terminated.
+    /// [`flush`](Self::flush) then sends what is left and terminates the connection.
     fn server_closing(&self) -> bool {
         self.role == Role::Server && !self.state.can_read()
     }
 
     /// Writes any data in the out_buffer, `additional_send` and given `data`.
     ///
-    /// Does **not** flush and does not terminate a closing server connection;
-    /// [`flush`](Self::flush) does both.
+    /// Does **not** flush.
     ///
     /// Returns true if the write contents indicate we should flush immediately.
     fn _write<Stream>(&mut self, stream: &mut Stream, data: Option<Frame>) -> Result<bool>
@@ -780,7 +778,16 @@ impl WebSocketContext {
         }
 
         trace!("Sending frame: {frame:?}");
-        self.frame.buffer_frame(stream, frame).check_connection_reset(self.state)
+        // The peer waits for our close frame in the close handshake, so it ignores the limit.
+        // `write` refuses frames once we are not active, so no other close frame gets here then.
+        let handshake_close =
+            !self.state.is_active() && frame.header().opcode == OpCode::Control(OpCtl::Close);
+        let result = if handshake_close {
+            self.frame.buffer_frame_ignoring_limit(stream, frame)
+        } else {
+            self.frame.buffer_frame(stream, frame)
+        };
+        result.check_connection_reset(self.state)
     }
 
     /// Replace `additional_send` if it is currently a `Pong` message.
