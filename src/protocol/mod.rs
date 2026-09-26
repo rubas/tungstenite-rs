@@ -303,6 +303,8 @@ impl<Stream: Read + Write> WebSocket<Stream> {
     /// - [`Error::Capacity`] if your message size is bigger than the configured max message size.
     /// - [`ProtocolError::ControlFrameTooBig`] if a ping or pong payload is over 125 bytes,
     ///   or a close reason is over 123 bytes. Nothing is sent and the connection stays open.
+    /// - [`ProtocolError::InvalidCloseSequence`] if a close code must not be sent,
+    ///   see [`CloseCode::is_allowed`]. Nothing is sent and the connection stays open.
     pub fn write(&mut self, message: Message) -> Result<()> {
         self.context.write(&mut self.socket, message)
     }
@@ -338,7 +340,9 @@ impl<Stream: Read + Write> WebSocket<Stream> {
     /// is returned from [`read`](Self::read) or [`flush`](Self::flush).
     ///
     /// A close reason over 123 bytes returns [`ProtocolError::ControlFrameTooBig`].
-    /// Nothing is sent and the connection stays open.
+    /// A close code that must not be sent, see [`CloseCode::is_allowed`], returns
+    /// [`ProtocolError::InvalidCloseSequence`]. In both cases nothing is sent and the
+    /// connection stays open.
     pub fn close(&mut self, code: Option<CloseFrame>) -> Result<()> {
         self.context.close(&mut self.socket, code)
     }
@@ -607,8 +611,13 @@ impl WebSocketContext {
         Stream: Read + Write,
     {
         if let WebSocketState::Active = self.state {
-            if code.as_ref().is_some_and(|c| c.reason.len() > 123) {
-                return Err(Error::Protocol(ProtocolError::ControlFrameTooBig));
+            if let Some(CloseFrame { code, reason }) = &code {
+                if !code.is_allowed() {
+                    return Err(Error::Protocol(ProtocolError::InvalidCloseSequence));
+                }
+                if reason.len() > 123 {
+                    return Err(Error::Protocol(ProtocolError::ControlFrameTooBig));
+                }
             }
             self.state = WebSocketState::ClosedByUs;
             self._write(stream, Some(Frame::close(code)))?;
