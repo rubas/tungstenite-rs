@@ -607,12 +607,11 @@ impl WebSocketContext {
         Stream: Read + Write,
     {
         if let WebSocketState::Active = self.state {
-            let frame = Frame::close(code);
-            if frame.payload().len() > 125 {
+            if code.as_ref().is_some_and(|c| c.reason.len() > 123) {
                 return Err(Error::Protocol(ProtocolError::ControlFrameTooBig));
             }
             self.state = WebSocketState::ClosedByUs;
-            self._write(stream, Some(frame))?;
+            self._write(stream, Some(Frame::close(code)))?;
         }
         self.flush(stream)
     }
