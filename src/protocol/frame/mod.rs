@@ -14,7 +14,10 @@ pub use self::{
 
 use crate::{
     error::{CapacityError, Error, ProtocolError, Result},
-    protocol::frame::mask::apply_mask,
+    protocol::frame::{
+        coding::{Control as OpCtl, OpCode},
+        mask::apply_mask,
+    },
     Message,
 };
 use bytes::BytesMut;
@@ -247,11 +250,15 @@ impl FrameCodec {
     /// To ensure buffered frames are written call [`Self::write_out_buffer`].
     ///
     /// May write to the stream, will **not** flush.
+    ///
+    /// A close frame is always queued, even over `max_out_buffer_len`.
     pub(super) fn buffer_frame<Stream>(&mut self, stream: &mut Stream, frame: Frame) -> Result<()>
     where
         Stream: Write,
     {
-        if frame.len() + self.out_buffer.len() > self.max_out_buffer_len {
+        // The peer waits for our close frame, so the limit must not drop it.
+        let is_close = frame.header().opcode == OpCode::Control(OpCtl::Close);
+        if !is_close && frame.len() + self.out_buffer.len() > self.max_out_buffer_len {
             return Err(Error::WriteBufferFull(Message::Frame(frame).into()));
         }
 

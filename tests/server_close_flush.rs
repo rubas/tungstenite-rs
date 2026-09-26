@@ -1,7 +1,11 @@
-//! Verifies that a server flushes its close reply before it reports `ConnectionClosed`.
+//! Verifies that a close frame reaches the peer, and that a server flushes its close reply
+//! before it reports `ConnectionClosed`.
 
 use std::io::{self, Cursor, Read, Write};
-use tungstenite::{protocol::Role, Error, Message, WebSocket};
+use tungstenite::{
+    protocol::{Role, WebSocketConfig},
+    Error, Message, WebSocket,
+};
 
 /// A masked close frame without a payload, as a client sends it.
 const CLIENT_CLOSE: [u8; 6] = [0x88, 0x80, 0, 0, 0, 0];
@@ -58,6 +62,25 @@ fn server_after_client_close(blocked_flushes: usize) -> WebSocket<BufferUntilFlu
     ws
 }
 
+/// Header and payload of the binary frame that fills the write buffer.
+const BINARY_FRAME_LEN: usize = 16;
+
+/// A server whose write buffer holds one binary frame and has no room for a close frame.
+fn server_with_full_write_buffer() -> WebSocket<BufferUntilFlush> {
+    let config = WebSocketConfig::default()
+        .write_buffer_size(BINARY_FRAME_LEN)
+        .max_write_buffer_size(BINARY_FRAME_LEN + 1);
+    let mut ws = WebSocket::from_raw_socket(BufferUntilFlush::new(0), Role::Server, Some(config));
+    ws.write(Message::binary(vec![7; BINARY_FRAME_LEN - 2])).unwrap();
+    assert!(ws.get_ref().buffered.is_empty());
+    ws
+}
+
+fn assert_binary_then_close(wire: &[u8]) {
+    assert_eq!(wire.len(), BINARY_FRAME_LEN + SERVER_CLOSE_REPLY.len());
+    assert_eq!(wire[BINARY_FRAME_LEN..], SERVER_CLOSE_REPLY);
+}
+
 fn assert_would_block(result: tungstenite::Result<impl std::fmt::Debug>) {
     match result {
         Err(Error::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {}
@@ -94,4 +117,32 @@ fn server_keeps_close_reply_when_flush_blocks_before_peer_eof() {
 
     assert!(matches!(ws.read(), Err(Error::ConnectionClosed)));
     assert_eq!(ws.get_ref().wire, SERVER_CLOSE_REPLY);
+}
+
+#[test]
+fn server_sends_close_reply_when_write_buffer_is_full() {
+    let mut ws = server_with_full_write_buffer();
+    assert_eq!(ws.read().unwrap(), Message::Close(None));
+
+    assert!(matches!(ws.read(), Err(Error::ConnectionClosed)));
+    assert_binary_then_close(&ws.get_ref().wire);
+}
+
+#[test]
+fn server_sends_close_reply_larger_than_max_write_buffer_size() {
+    // The smallest limit the config allows. A close frame has at least 2 bytes.
+    let config = WebSocketConfig::default().write_buffer_size(0).max_write_buffer_size(1);
+    let mut ws = WebSocket::from_raw_socket(BufferUntilFlush::new(0), Role::Server, Some(config));
+    assert_eq!(ws.read().unwrap(), Message::Close(None));
+
+    assert!(matches!(ws.read(), Err(Error::ConnectionClosed)));
+    assert_eq!(ws.get_ref().wire, SERVER_CLOSE_REPLY);
+}
+
+#[test]
+fn close_queues_close_frame_when_write_buffer_is_full() {
+    let mut ws = server_with_full_write_buffer();
+
+    ws.close(None).unwrap();
+    assert_binary_then_close(&ws.get_ref().wire);
 }

@@ -74,6 +74,8 @@ pub struct WebSocketConfig {
     ///
     /// Note: Should always be at least [`write_buffer_size + 1 message`](Self::write_buffer_size)
     /// and probably a little more depending on error handling strategy.
+    ///
+    /// Note: A close frame is always queued, even if it goes over this limit.
     pub max_write_buffer_size: usize,
     /// The maximum size of an incoming message. `None` means no size limit. The default value is 64 MiB
     /// which should be reasonably big for all normal use-cases but small enough to prevent
@@ -276,7 +278,8 @@ impl<Stream: Read + Write> WebSocket<Stream> {
     /// or [`flush`](Self::flush).
     ///
     /// If the write buffer would exceed the configured [`WebSocketConfig::max_write_buffer_size`]
-    /// [`Err(WriteBufferFull(msg_frame))`](Error::WriteBufferFull) is returned.
+    /// [`Err(WriteBufferFull(msg_frame))`](Error::WriteBufferFull) is returned. A close frame
+    /// is always queued.
     ///
     /// This call will generally not flush. However, if there are queued automatic messages
     /// they will be written and eagerly flushed.
@@ -488,7 +491,8 @@ impl WebSocketContext {
     /// or [`flush`](Self::flush).
     ///
     /// If the write buffer would exceed the configured [`WebSocketConfig::max_write_buffer_size`]
-    /// [`Err(WriteBufferFull(msg_frame))`](Error::WriteBufferFull) is returned.
+    /// [`Err(WriteBufferFull(msg_frame))`](Error::WriteBufferFull) is returned. A close frame
+    /// is always queued.
     pub fn write<Stream>(&mut self, stream: &mut Stream, message: Message) -> Result<()>
     where
         Stream: Read + Write,
@@ -579,7 +583,7 @@ impl WebSocketContext {
             trace!("Sending pong/close");
             match self.buffer_frame(stream, msg) {
                 Err(Error::WriteBufferFull(msg)) => {
-                    // if an system message would exceed the buffer put it back in
+                    // if a pong would exceed the buffer put it back in
                     // `additional_send` for retry. Otherwise returning this error
                     // may not make sense to the user, e.g. calling `flush`.
                     if let Message::Frame(msg) = *msg {
