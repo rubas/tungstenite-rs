@@ -84,6 +84,10 @@ name = "read"
 harness = false
 
 [[bench]]
+name = "many_conns"
+harness = false
+
+[[bench]]
 name = "e2e"
 harness = false
 required-features = ["handshake"]
