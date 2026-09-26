@@ -75,8 +75,8 @@ pub struct WebSocketConfig {
     /// Note: Should always be at least [`write_buffer_size + 1 message`](Self::write_buffer_size)
     /// and probably a little more depending on error handling strategy.
     ///
-    /// Note: The close frame of the close handshake is always queued, even if it goes over
-    /// this limit.
+    /// Note: Pong frames and the close frame of the close handshake are always sent, even if
+    /// one goes over this limit.
     pub max_write_buffer_size: usize,
     /// The maximum size of an incoming message. `None` means no size limit. The default value is 64 MiB
     /// which should be reasonably big for all normal use-cases but small enough to prevent
@@ -372,10 +372,9 @@ pub struct WebSocketContext {
     state: WebSocketState,
     /// Receive: an incomplete message being processed.
     incomplete: Option<IncompleteMessage>,
-    /// Send in addition to regular messages E.g. "pong" or "close".
+    /// A pong or close frame that waits for room in the write buffer.
     additional_send: Option<Frame>,
-    /// True indicates there is an additional message (like a pong)
-    /// that failed to flush previously and we should try again.
+    /// True while a queued pong or close frame is not flushed yet.
     unflushed_additional: bool,
     /// The configuration for the websocket session.
     config: WebSocketConfig,
@@ -467,10 +466,7 @@ impl WebSocketContext {
                     // If blocked continue reading, but try again later. A closing server must
                     // not read on: it would get EOF and terminate before its close reply is sent.
                     Err(Error::Io(err))
-                        if err.kind() == io::ErrorKind::WouldBlock && !self.server_closing() =>
-                    {
-                        self.unflushed_additional = true;
-                    }
+                        if err.kind() == io::ErrorKind::WouldBlock && !self.server_closing() => {}
                     Err(err) => return Err(err),
                 }
             }
@@ -514,14 +510,15 @@ impl WebSocketContext {
             Message::Pong(data) => {
                 self.set_additional(Frame::pong(data));
                 // Note: user pongs can be user flushed so no need to flush here
-                return self._write(stream, None).map(|_| ());
+                return self.queue_additional(stream, true);
             }
             Message::Close(code) => return self.close(stream, code),
             Message::Frame(f) => f,
         };
 
-        let should_flush = self._write(stream, Some(frame))?;
-        if should_flush {
+        self.buffer_frame(stream, frame, true)?;
+        self.queue_additional(stream, true)?;
+        if self.unflushed_additional {
             self.flush(stream)?;
         }
         Ok(())
@@ -536,8 +533,14 @@ impl WebSocketContext {
     where
         Stream: Read + Write,
     {
-        self._write(stream, None)?;
-        self.frame.write_out_buffer(stream)?;
+        self.queue_additional(stream, true)?;
+        self.frame.write_out_buffer(stream).check_connection_reset(self.state)?;
+        // The buffer is empty now. A frame that did not fit goes in even if it is bigger than
+        // `max_write_buffer_size`.
+        if self.additional_send.is_some() {
+            self.queue_additional(stream, false)?;
+            self.frame.write_out_buffer(stream).check_connection_reset(self.state)?;
+        }
         stream.flush()?;
         self.unflushed_additional = false;
 
@@ -561,44 +564,30 @@ impl WebSocketContext {
         self.role == Role::Server && !self.state.can_read()
     }
 
-    /// Writes any data in the out_buffer, `additional_send` and given `data`.
-    ///
-    /// Does **not** flush.
-    ///
-    /// Returns true if the write contents indicate we should flush immediately.
-    fn _write<Stream>(&mut self, stream: &mut Stream, data: Option<Frame>) -> Result<bool>
+    /// Move `additional_send` into the write buffer, behind the frames already there.
+    /// With `check_limit`, it stays in `additional_send` if it does not fit.
+    fn queue_additional<Stream>(&mut self, stream: &mut Stream, check_limit: bool) -> Result<()>
     where
         Stream: Read + Write,
     {
-        if let Some(data) = data {
-            self.buffer_frame(stream, data)?;
-        }
-
         // Upon receipt of a Ping frame, an endpoint MUST send a Pong frame in
         // response, unless it already received a Close frame. It SHOULD
         // respond with Pong frame as soon as is practical. (RFC 6455)
-        let should_flush = if let Some(msg) = self.additional_send.take() {
-            trace!("Sending pong/close");
-            match self.buffer_frame(stream, msg) {
-                Err(Error::WriteBufferFull(msg)) => {
-                    // if a pong would exceed the buffer put it back in
-                    // `additional_send` for retry. Otherwise returning this error
-                    // may not make sense to the user, e.g. calling `flush`.
-                    if let Message::Frame(msg) = *msg {
-                        self.set_additional(msg);
-                        false
-                    } else {
-                        unreachable!()
-                    }
-                }
-                Err(err) => return Err(err),
-                Ok(_) => true,
+        let Some(frame) = self.additional_send.take() else { return Ok(()) };
+        trace!("Sending pong/close");
+        match self.buffer_frame(stream, frame, check_limit) {
+            // Wait for room. A newer pong can still replace it.
+            Err(Error::WriteBufferFull(msg)) => {
+                let Message::Frame(frame) = *msg else { unreachable!() };
+                self.additional_send = Some(frame);
+                Ok(())
             }
-        } else {
-            self.unflushed_additional
-        };
-
-        Ok(should_flush)
+            // The frame is in the buffer, even if writing it out failed.
+            result => {
+                self.unflushed_additional = true;
+                result
+            }
+        }
     }
 
     /// Close the connection.
@@ -612,8 +601,7 @@ impl WebSocketContext {
     {
         if let WebSocketState::Active = self.state {
             self.state = WebSocketState::ClosedByUs;
-            let frame = Frame::close(code);
-            self._write(stream, Some(frame))?;
+            self.set_additional(Frame::close(code));
         }
         self.flush(stream)
     }
@@ -763,8 +751,14 @@ impl WebSocketContext {
         }
     }
 
-    /// Write a single frame into the write-buffer.
-    fn buffer_frame<Stream>(&mut self, stream: &mut Stream, mut frame: Frame) -> Result<()>
+    /// Write a single frame into the write-buffer. With `check_limit`, return
+    /// [`Error::WriteBufferFull`] if it would go over `max_write_buffer_size`.
+    fn buffer_frame<Stream>(
+        &mut self,
+        stream: &mut Stream,
+        mut frame: Frame,
+        check_limit: bool,
+    ) -> Result<()>
     where
         Stream: Read + Write,
     {
@@ -778,14 +772,10 @@ impl WebSocketContext {
         }
 
         trace!("Sending frame: {frame:?}");
-        // The peer waits for our close frame in the close handshake, so it ignores the limit.
-        // `write` refuses frames once we are not active, so no other close frame gets here then.
-        let handshake_close =
-            !self.state.is_active() && frame.header().opcode == OpCode::Control(OpCtl::Close);
-        let result = if handshake_close {
-            self.frame.buffer_frame_ignoring_limit(stream, frame)
-        } else {
+        let result = if check_limit {
             self.frame.buffer_frame(stream, frame)
+        } else {
+            self.frame.buffer_frame_ignoring_limit(stream, frame)
         };
         result.check_connection_reset(self.state)
     }
