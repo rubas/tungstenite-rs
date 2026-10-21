@@ -158,6 +158,7 @@ impl FrameCodec {
     }
 
     /// Read a frame from the provided stream.
+    #[inline]
     pub(super) fn read_frame(
         &mut self,
         stream: &mut impl Read,
@@ -247,6 +248,7 @@ impl FrameCodec {
     /// To ensure buffered frames are written call [`Self::write_out_buffer`].
     ///
     /// May write to the stream, will **not** flush.
+    #[inline]
     pub(super) fn buffer_frame<Stream>(&mut self, stream: &mut Stream, frame: Frame) -> Result<()>
     where
         Stream: Write,
