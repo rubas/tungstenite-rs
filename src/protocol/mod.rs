@@ -833,6 +833,7 @@ trait CheckConnectionReset {
 }
 
 impl<T> CheckConnectionReset for Result<T> {
+    #[inline]
     fn check_connection_reset(self, state: WebSocketState) -> Self {
         match self {
             Err(Error::Io(io_error)) => Err({

@@ -158,6 +158,7 @@ impl FrameCodec {
     }
 
     /// Read a frame from the provided stream.
+    #[inline]
     pub(super) fn read_frame(
         &mut self,
         stream: &mut impl Read,
